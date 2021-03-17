@@ -1,23 +1,18 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/6sack/gocqlx/qb"
-	"github.com/gocql/gocql"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/scylladb/gocqlx"
 )
 
 var (
@@ -25,8 +20,6 @@ var (
 	iterations     = 0
 	flagBenchmarks *string
 	benchmarks     []string
-	people         []*benchPerson
-	session        *gocql.Session
 
 	flagMetricsPort *string
 
@@ -112,15 +105,6 @@ var (
 	)
 )
 
-type benchPerson struct {
-	ID        int      `json:"id"`
-	FirstName string   `json:"first_name"`
-	LastName  string   `json:"last_name"`
-	Email     []string `json:"email"`
-	Gender    string   `json:"gender"`
-	IPAddress string   `json:"ip_address"`
-}
-
 type bench func(*testing.B)
 
 // Benchmark struct
@@ -130,8 +114,6 @@ type Benchmark struct {
 }
 
 var benchPersonSchema string
-
-var benchPersonCols = []string{"id", "first_name", "last_name", "email", "gender", "ip_address"}
 
 func init() {
 	flag.IntVar(&workers, "workers", 10, "Number of workers to use")
@@ -152,106 +134,6 @@ func init() {
 	flagPassword = flag.String("password", "", "the password to use for auth enabled clusters")
 }
 
-func loadFixtures() []*benchPerson {
-	f, err := os.Open("testdata/people.json")
-	if err != nil {
-		panic(err)
-	}
-	defer func() {
-		if err := f.Close(); err != nil {
-			panic(err)
-		}
-	}()
-
-	var v []*benchPerson
-	if err := json.NewDecoder(f).Decode(&v); err != nil {
-		panic(err)
-	}
-
-	return v
-}
-
-func initTable(b *testing.B, session *gocql.Session, people []*benchPerson) {
-	if err := ExecStmt(session, benchPersonSchema); err != nil {
-		log.Println(err)
-	}
-
-	stmt, names := qb.Insert(*flagKeyspace + ".bench_person").Columns(benchPersonCols...).ToCql()
-	q := gocqlx.Query(session.Query(stmt), names)
-
-	for _, p := range people {
-		if err := q.BindStruct(p).Exec(); err != nil {
-			log.Println(err)
-		}
-	}
-}
-
-// BenchmarkE2EGocqlxSelect performs select.
-func BenchmarkE2EGocqlxSelect(b *testing.B) {
-	log.Printf("starting\n")
-	//defer session.Close()
-
-	//initTable(b, session, people)
-
-	stmt, _ := qb.Select(*flagKeyspace + ".bench_person").Columns(benchPersonCols...).Limit(100).ToCql()
-
-	for i := 0; i < b.N; i++ {
-		// prepare
-		q := session.Query(stmt)
-		var v []*benchPerson
-		// select and release
-		if err := gocqlx.Query(q, nil).SelectRelease(&v); err != nil {
-			log.Printf("Error: %s", err)
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
-}
-
-// BenchmarkE2EGocqlxGet performs get.
-func BenchmarkE2EGocqlxGet(b *testing.B) {
-	log.Printf("starting\n")
-	//defer session.Close()
-
-	//initTable(b, session, people)
-
-	stmt, _ := qb.Select(*flagKeyspace + ".bench_person").Columns(benchPersonCols...).Where(qb.Eq("id")).Limit(1).ToCql()
-	var p benchPerson
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		// prepare
-		rand.Seed(time.Now().UnixNano())
-		q := session.Query(stmt).Bind(rand.Intn(1000000-1+1) + 1)
-		//q := session.Query(stmt).Bind(people[i%len(people)].ID)
-		// get and release
-		if err := gocqlx.Query(q, nil).GetRelease(&p); err != nil {
-			log.Printf("Error: %s", err)
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
-}
-
-// BenchmarkE2EGocqlxInsert performs insert with struct binding.
-func BenchmarkE2EGocqlxInsert(b *testing.B) {
-	log.Printf("starting\n")
-	//defer session.Close()
-
-	stmt, names := qb.Insert(*flagKeyspace + ".bench_person").Columns(benchPersonCols...).ToCql()
-	q := gocqlx.Query(session.Query(stmt), names)
-	defer q.Release()
-
-	for i := 0; i < b.N; i++ {
-		rand.Seed(time.Now().UnixNano())
-		p := people[i%len(people)]
-		p.ID = rand.Intn(1000000-1+1) + 1
-		//fmt.Println(p)
-		if err := q.BindStruct(p).Exec(); err != nil {
-			log.Printf("Error: %s", err)
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
-}
-
 func trackBenchmark(bench bench, b *testing.B) testing.BenchmarkResult {
 	start := time.Now()
 	bench(b)
@@ -263,7 +145,7 @@ func makeBenchmark() *Benchmark {
 	t := benchmarks[rand.Int()%len(benchmarks)]
 	b := &Benchmark{
 		Type:      t,
-		Benchmark: BenchmarkE2EGocqlxInsert,
+		Benchmark: benchmarks.BenchmarkE2EGocqlxInsert,
 	}
 	switch t {
 	case "insert":
@@ -292,10 +174,10 @@ func startBenchmarkProcessor(benchmarks <-chan *Benchmark) {
 		N: iterations,
 	}
 
-	log.Printf("[INFO] loading data into memory\n")
-	people = loadFixtures()
+	//log.Printf("[INFO] loading data into memory\n")
+	//people = loadFixtures()
 
-	if err := ExecStmt(session, benchPersonSchema); err != nil {
+	if err := session.ExecStmt(session, benchPersonSchema); err != nil {
 		log.Println(err)
 	}
 
@@ -341,96 +223,6 @@ func startWorker(workerID int, b *testing.B, benchmarks <-chan *Benchmark) {
 			}
 		}
 	}
-}
-
-var initOnce sync.Once
-
-// CreateSession creates a new gocql session from flags.
-func CreateSession(tb testing.TB) *gocql.Session {
-	cluster := createCluster()
-	return createSessionFromCluster(cluster, tb)
-}
-
-func createCluster() *gocql.ClusterConfig {
-	fmt.Printf("trying to connect to cluster hosts: %s", clusterHosts)
-	cluster := gocql.NewCluster(clusterHosts...)
-	if len(*flagUsername) > 0 && len(*flagPassword) > 0 {
-		cluster.Authenticator = gocql.PasswordAuthenticator{
-			Username: *flagUsername,
-			Password: *flagPassword,
-		}
-	}
-	cluster.ProtoVersion = *flagProto
-	cluster.CQLVersion = *flagCQL
-	cluster.Timeout = *flagTimeout
-	cluster.Consistency = gocql.Quorum
-	cluster.NumConns = *flagNumConn
-	cluster.MaxWaitSchemaAgreement = 2 * time.Minute // travis might be slow
-	if *flagRetry > 0 {
-		cluster.RetryPolicy = &gocql.SimpleRetryPolicy{NumRetries: *flagRetry}
-	}
-
-	switch *flagCompressTest {
-	case "snappy":
-		cluster.Compressor = &gocql.SnappyCompressor{}
-	case "":
-	default:
-		panic("invalid compressor: " + *flagCompressTest)
-	}
-
-	return cluster
-}
-
-func createSessionFromCluster(cluster *gocql.ClusterConfig, tb testing.TB) *gocql.Session {
-	// Drop and re-create the keyspace once. Different tests should use their own
-	// individual tables, but can assume that the table does not exist before.
-	initOnce.Do(func() {
-		if *flagCreateKeyspace == true {
-			createKeyspace(tb, cluster, *flagKeyspace)
-		}
-	})
-
-	cluster.Keyspace = *flagKeyspace
-	session, err := cluster.CreateSession()
-	if err != nil {
-		log.Println("CreateSession:", err)
-	}
-
-	return session
-}
-
-func createKeyspace(tb testing.TB, cluster *gocql.ClusterConfig, keyspace string) {
-	log.Printf("[INFO] recreating keyspace: %s with replication of %d", keyspace, *flagRF)
-	c := *cluster
-	c.Keyspace = "system"
-	c.Timeout = 30 * time.Second
-	session, err := c.CreateSession()
-	if err != nil {
-		log.Println(err)
-	}
-	defer session.Close()
-
-	err = ExecStmt(session, `DROP KEYSPACE IF EXISTS `+keyspace)
-	if err != nil {
-		log.Printf("unable to drop keyspace: %v", err)
-	}
-
-	err = ExecStmt(session, fmt.Sprintf(`CREATE KEYSPACE %s
-	WITH replication = {
-		'class' : 'SimpleStrategy',
-		'replication_factor' : %d
-	}`, keyspace, *flagRF))
-
-	if err != nil {
-		log.Printf("unable to create keyspace: %v", err)
-	}
-}
-
-// ExecStmt executes a statement string.
-func ExecStmt(s *gocql.Session, stmt string) error {
-	q := s.Query(stmt).RetryPolicy(nil)
-	defer q.Release()
-	return q.Exec()
 }
 
 func queryWorkloadPrioritization() {
@@ -485,7 +277,7 @@ func main() {
 	}
 
 	log.Printf("[INFO] creating session and keyspaces\n")
-	session = CreateSession(bt)
+	session = session.CreateSession(clusterHosts, false, bt)
 
 	benchmarkChannel := make(chan *Benchmark, 10000)
 
